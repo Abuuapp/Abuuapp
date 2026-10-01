@@ -658,15 +658,39 @@ namespace cAlgo.Robots
             double volume = CalculateVolume(slPips);
             if (volume <= 0) return;
 
-            TradeResult result = useMarket
-                ? ExecuteMarketOrder(type, SymbolName, volume, TradeLabel, slPips, tpPips)
-                : PlaceLimitOrder(type, SymbolName, volume, entry, TradeLabel,
+            TradeResult result;
+            if (useMarket)
+            {
+                _openingMarketEntry = true;   // the TRADE OPENED log is printed below, after the exact SL/TP are set
+                try
+                {
+                    result = ExecuteMarketOrder(type, SymbolName, volume, TradeLabel, slPips, tpPips);
+                }
+                finally
+                {
+                    _openingMarketEntry = false;
+                }
+            }
+            else
+            {
+                result = PlaceLimitOrder(type, SymbolName, volume, entry, TradeLabel,
                     stop, Math.Round(target, Symbol.Digits), ProtectionType.Absolute);
+            }
 
             if (!result.IsSuccessful)
             {
                 Print("{0} order FAILED: {1}", type, result.Error);
                 return;
+            }
+
+            if (useMarket && result.Position != null)
+            {
+                var pos = result.Position;
+                SetExactStopAndTarget(pos, stop);
+                entry = pos.EntryPrice;
+                if (pos.StopLoss.HasValue) stop = pos.StopLoss.Value;
+                if (pos.TakeProfit.HasValue) target = pos.TakeProfit.Value;
+                LogTradeOpened(pos);
             }
 
             if (!useMarket) f.Order = result.PendingOrder;
@@ -751,10 +775,42 @@ namespace cAlgo.Robots
         private bool IsOwnPosition(Position p) =>
             p != null && p.Label == TradeLabel && p.SymbolName == SymbolName;
 
+        private bool _openingMarketEntry;
+
         private void OnPositionOpened(PositionOpenedEventArgs args)
         {
             if (!IsOwnPosition(args.Position)) return;
+            if (_openingMarketEntry) return;   // logged by TryPlaceOrder once the exact SL/TP are in place
             LogTradeOpened(args.Position);
+        }
+
+        // Market entries are sent with SL/TP in pips, which are measured from the FILL price, so
+        // slippage would move the stop away from the strategy's level. Right after the fill (part of
+        // opening the trade, never changed afterwards) the stop is put on the EXACT strategy price and
+        // the take profit at exactly 2 x the real entry-to-stop distance.
+        private void SetExactStopAndTarget(Position pos, double stop)
+        {
+            bool isBuy = pos.TradeType == TradeType.Buy;
+            double fill = pos.EntryPrice;
+            double riskDistance = isBuy ? fill - stop : stop - fill;
+            if (riskDistance <= 0) return;   // filled through the stop: keep the broker's pip-based SL
+
+            double tp = Math.Round(isBuy ? fill + riskDistance * RewardMultiple
+                                         : fill - riskDistance * RewardMultiple, Symbol.Digits);
+
+            bool slDiffers = !pos.StopLoss.HasValue || Math.Abs(pos.StopLoss.Value - stop) > Symbol.TickSize / 2;
+            if (slDiffers)
+            {
+                var r = pos.ModifyStopLossPrice(stop);
+                if (!r.IsSuccessful) Print("Could not set the exact stop loss {0}: {1}", Fmt(stop), r.Error);
+            }
+
+            bool tpDiffers = !pos.TakeProfit.HasValue || Math.Abs(pos.TakeProfit.Value - tp) > Symbol.TickSize / 2;
+            if (tpDiffers)
+            {
+                var r = pos.ModifyTakeProfitPrice(tp);
+                if (!r.IsSuccessful) Print("Could not set the 1:2 take profit {0}: {1}", Fmt(tp), r.Error);
+            }
         }
 
         private void LogTradeOpened(Position p)
