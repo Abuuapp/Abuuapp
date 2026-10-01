@@ -20,18 +20,15 @@
 //   - Trend HH/HL (bullish): BUY LIMIT at the 0.62 level.
 //   - Trend LH/LL (bearish): SELL LIMIT at the 0.62 level.
 //   - Stop loss at Fib level 1 (the HL for buys, the LH for sells).
-//   - Take profit = Risk:Reward x stop distance (default 1:2).
+//   - Take profit = exactly 2 x the stop distance (1:2), set when the order is placed.
+//   - Volume = 1% (Risk %) of the CURRENT account BALANCE at the stop loss.
 //   - The pending order is cancelled if the setup is invalidated,
 //     replaced by a newer Fib, or the trend flips.
 //
-//  STEP 4 - Open-trade management (partial profit + break even)
-//   - 1R is stored from the ORIGINAL entry and ORIGINAL stop when the
-//     position opens, and is never recalculated.
-//   - At +1R (Bid for buys, Ask for sells), ONCE per position:
-//       * close 50% of the ORIGINAL volume (normalized to broker steps),
-//       * move the stop on the remaining volume to the original entry,
-//       * keep the original take profit (Risk:Reward x 1R, default 2R).
-//   - The runner then exits at that take profit or at break even.
+//  STEP 4 - No trade management
+//   - Every position stays FULLY open with its ORIGINAL stop loss and ORIGINAL
+//     1:2 take profit until one of them is hit. No partial close, no break
+//     even, no trailing, no SL/TP modification after entry.
 //
 //  NEWS FILTER (live trading only)
 //   - Downloads the Forex Factory weekly calendar (JSON) every few hours.
@@ -49,7 +46,8 @@
 //   - Compounds: every month starts from the actual balance at that time.
 //   - When the realized BALANCE reaches the target, no new trades are
 //     opened for the rest of the month (pending orders are cancelled).
-//     Open positions keep their normal SL / 1R partial / BE / 2R management.
+//     Open positions are never modified or closed by the lock - they run to
+//     their original SL or original 1:2 TP.
 //   - Survives restarts: state is saved (live) and can be rebuilt from
 //     this month's closed-trade history.
 // =====================================================================
@@ -94,12 +92,6 @@ namespace cAlgo.Robots
         public string Impact;
     }
 
-    public enum VolumeSizing
-    {
-        FixedLots,
-        RiskPercentOfBalance
-    }
-
     public class SwingPoint
     {
         public int Index;
@@ -133,25 +125,6 @@ namespace cAlgo.Robots
 
         // price = level0 + level * (level1 - level0)
         public double PriceAt(double level) => Zero.Price + level * (One.Price - Zero.Price);
-    }
-
-    // Per-position trade-management state (STEP 4). Filled once when the position
-    // opens and never recalculated afterwards.
-    public class PositionState
-    {
-        public int PositionId;
-        public TradeType Direction;
-        public double OriginalEntry;
-        public double OriginalStopLoss;
-        public double OriginalRisk;        // price distance entry -> original SL
-        public double OriginalVolume;      // units, BEFORE any partial close
-        public double OneRPrice;
-        public double TargetPrice;         // entry +/- RewardRatio x risk
-        public double? FinalTakeProfit;    // the take profit the position was opened with
-        public bool OneRReached;
-        public bool PartialTaken;          // true once the 50% close has been ATTEMPTED (never retried)
-        public bool BreakEvenActivated;    // true once the stop is at the original entry
-        public int BreakEvenAttempts;
     }
 
     [Robot(AccessRights = AccessRights.FullAccess, AddIndicators = true)]
@@ -189,15 +162,6 @@ namespace cAlgo.Robots
         // ---------------- Trading ----------------
         [Parameter("Enable Trading", DefaultValue = true, Group = "Trading")]
         public bool EnableTrading { get; set; }
-
-        [Parameter("Risk:Reward (1:X)", DefaultValue = 2.0, MinValue = 0.1, Group = "Trading")]
-        public double RewardRatio { get; set; }
-
-        [Parameter("Volume Sizing", DefaultValue = VolumeSizing.RiskPercentOfBalance, Group = "Trading")]
-        public VolumeSizing SizingMode { get; set; }
-
-        [Parameter("Fixed Lots", DefaultValue = 0.01, MinValue = 0.0001, Group = "Trading")]
-        public double FixedLots { get; set; }
 
         [Parameter("Risk % of Balance", DefaultValue = 1.0, MinValue = 0.01, MaxValue = 100, Group = "Trading")]
         public double RiskPercent { get; set; }
@@ -287,8 +251,8 @@ namespace cAlgo.Robots
         private readonly Dictionary<string, string> _labels = new Dictionary<string, string>();
         private readonly List<double> _fibLevels = new List<double>();
 
-        // STEP 4: trade-management state, keyed by Position.Id
-        private readonly Dictionary<int, PositionState> _positionStates = new Dictionary<int, PositionState>();
+        // Take profit = 2 x the original stop distance (fixed 1:2 risk-to-reward).
+        private const double RewardMultiple = 2.0;
 
         private bool CanDraw => DrawOnChart && RunningMode != RunningMode.Optimization;
 
@@ -301,9 +265,10 @@ namespace cAlgo.Robots
             Positions.Closed += OnPositionClosed;
             Positions.Opened += OnPositionOpened;
 
-            // STEP 4: pick up positions this bot already had open (e.g. after a restart).
-            foreach (var p in Positions.Where(IsOwnPosition).ToList())
-                RegisterPosition(p, true);
+            // Positions this bot already had open (e.g. after a restart) are left untouched.
+            int existing = Positions.Count(IsOwnPosition);
+            if (existing > 0)
+                Print("{0} open position(s) found - they keep their original SL and TP.", existing);
 
             // Remove leftover pending orders from a previous run (they are re-created below).
             foreach (var o in PendingOrders.Where(o => o.Label == TradeLabel && o.SymbolName == SymbolName).ToList())
@@ -359,7 +324,7 @@ namespace cAlgo.Robots
             _tickCount++;
             CheckMonthlyTarget();
             if (NewsFilterOn) UpdateNewsState();
-            ManageOpenPositions();        // STEP 4: partial close + break even
+            CheckUnprotectedPositions();  // safety only: positions with a stop loss are never touched
         }
 
         protected override void OnStop()
@@ -683,9 +648,12 @@ namespace cAlgo.Robots
                 return;
             }
 
-            double slPips = Math.Abs(entry - stop) / Symbol.PipSize;
-            double tpPips = slPips * RewardRatio;
-            double target = f.IsBullish ? entry + tpPips * Symbol.PipSize : entry - tpPips * Symbol.PipSize;
+            // 1:2 - take profit from the ORIGINAL stop distance.
+            double riskDistance = f.IsBullish ? entry - stop : stop - entry;
+            double target = f.IsBullish ? entry + riskDistance * RewardMultiple
+                                        : entry - riskDistance * RewardMultiple;
+            double slPips = riskDistance / Symbol.PipSize;
+            double tpPips = slPips * RewardMultiple;
 
             double volume = CalculateVolume(slPips);
             if (volume <= 0) return;
@@ -705,30 +673,24 @@ namespace cAlgo.Robots
 
             Print("{0} {1} placed | Entry {2} | SL {3} ({4:0.0} pips) | TP {5} ({6:0.0} pips) | RR 1:{7} | Volume {8}",
                 type, useMarket ? "MARKET" : "LIMIT", Fmt(entry), Fmt(stop), slPips,
-                Fmt(target), tpPips, RewardRatio, volume);
+                Fmt(target), tpPips, RewardMultiple, volume);
 
             if (CanDraw) DrawTradeBox(f, entry, stop, target);
         }
 
         private double CalculateVolume(double slPips)
         {
-            double units;
-            if (SizingMode == VolumeSizing.FixedLots)
-            {
-                units = Symbol.QuantityToVolumeInUnits(FixedLots);
-            }
-            else
-            {
-                double riskMoney = Account.Balance * RiskPercent / 100.0;
-                units = riskMoney / (slPips * Symbol.PipValue);
-            }
+            // Risk is recalculated for every new trade from the CURRENT balance (never equity).
+            double riskMoney = Account.Balance * RiskPercent / 100.0;
+            double units = riskMoney / (slPips * Symbol.PipValue);
 
+            // Rounded DOWN to the broker's volume step, so the risk never exceeds Risk %.
             units = Symbol.NormalizeVolumeInUnits(units, RoundingMode.Down);
 
             if (units < Symbol.VolumeInUnitsMin)
             {
-                Print("Skipped trade: calculated volume is below the broker minimum ({0} units). " +
-                      "Increase Risk % or use Fixed Lots.", Symbol.VolumeInUnitsMin);
+                Print("Skipped trade: volume for {0} risk is below the broker minimum ({1} units). " +
+                      "Increase Risk % or the account balance.", Money(riskMoney), Symbol.VolumeInUnitsMin);
                 return 0;
             }
 
@@ -768,10 +730,7 @@ namespace cAlgo.Robots
         private void OnPositionClosed(PositionClosedEventArgs args)
         {
             if (!IsOwnPosition(args.Position)) return;
-            Print("Position CLOSED ({0}): {1} net profit {2:0.00}", args.Reason,
-                args.Position.TradeType, args.Position.NetProfit);
-
-            LogFinalExit(args.Position, args.Reason);
+            LogTradeClosed(args.Position, args.Reason);
             CheckMonthlyTarget();
             _noStopWarned.Remove(args.Position.Id);
             _noStopSinceTick.Remove(args.Position.Id);
@@ -782,8 +741,8 @@ namespace cAlgo.Robots
         }
 
         // =====================================================================
-        //  STEP 4 - Open-trade management: 50% at +1R, runner to break even,
-        //  final exit at the original take profit or at break even.
+        //  STEP 4 - No trade management: every position stays FULLY open with
+        //  its original stop loss and original 1:2 take profit until one is hit.
         // =====================================================================
         private readonly HashSet<int> _noStopWarned = new HashSet<int>();
         private readonly Dictionary<int, long> _noStopSinceTick = new Dictionary<int, long>();
@@ -795,225 +754,79 @@ namespace cAlgo.Robots
         private void OnPositionOpened(PositionOpenedEventArgs args)
         {
             if (!IsOwnPosition(args.Position)) return;
-            RegisterPosition(args.Position, false);
+            LogTradeOpened(args.Position);
         }
 
-        // Stores the ORIGINAL entry, stop, risk and volume. Called once per position.
-        // Returns false if the position cannot be managed yet (no stop loss attached).
-        private bool RegisterPosition(Position p, bool afterRestart)
+        private void LogTradeOpened(Position p)
         {
-            if (_positionStates.ContainsKey(p.Id)) return true;
+            if (!p.StopLoss.HasValue) { WarnNoStop(p); return; }
 
-            if (!p.StopLoss.HasValue)
-            {
-                if (_noStopWarned.Add(p.Id))
-                {
-                    _noStopSinceTick[p.Id] = _tickCount;
-                    Print("WARNING: position {0} has NO stop loss (e.g. filled through the stop on a price gap). {1}",
-                        p.Id, CloseUnprotectedPositions
-                            ? "It will be closed if no stop loss is attached by the next tick."
-                            : "'Close Positions Without Stop Loss' is OFF - the position is UNPROTECTED.");
-                }
-                return false;
-            }
-
-            bool isBuy = p.TradeType == TradeType.Buy;
-            double entry = p.EntryPrice;
             double sl = p.StopLoss.Value;
-            double risk = isBuy ? entry - sl : sl - entry;
+            double riskDistance = Math.Abs(p.EntryPrice - sl);
+            double riskAmount = riskDistance / Symbol.PipSize * Symbol.PipValue * p.VolumeInUnits;
 
-            var s = new PositionState
-            {
-                PositionId = p.Id,
-                Direction = p.TradeType,
-                OriginalEntry = entry,
-                OriginalStopLoss = sl,
-                OriginalRisk = risk,
-                OriginalVolume = p.VolumeInUnits,
-                OneRPrice = isBuy ? entry + risk : entry - risk,
-                TargetPrice = isBuy ? entry + RewardRatio * risk : entry - RewardRatio * risk,
-                FinalTakeProfit = p.TakeProfit
-            };
-
-            // A stop at (or beyond) the entry means there is no initial risk to measure 1R from.
-            // After a restart this normally means break even was already applied earlier.
-            if (risk <= Symbol.TickSize / 2)
-            {
-                s.OneRReached = true;
-                s.PartialTaken = true;
-                s.BreakEvenActivated = true;
-                _positionStates[p.Id] = s;
-                Print("Position {0}: stop is already at/through the entry ({1}) - treated as a break-even runner, " +
-                      "no further partial close.", p.Id, Fmt(sl));
-                return true;
-            }
-
-            _positionStates[p.Id] = s;
-
-            Print("---------------- TRADE OPENED{0} ----------------", afterRestart ? " (picked up after restart)" : "");
-            Print("Position ID: {0}", s.PositionId);
-            Print("Direction: {0}", s.Direction);
-            Print("Entry: {0}", Fmt(s.OriginalEntry));
-            Print("Original SL: {0}", Fmt(s.OriginalStopLoss));
-            Print("Original Risk (1R distance): {0}", Fmt(s.OriginalRisk));
-            Print("Original Volume: {0}", s.OriginalVolume);
-            Print("1R Level: {0}", Fmt(s.OneRPrice));
-            Print("{0}R Level: {1}", RewardRatio, Fmt(s.TargetPrice));
-            Print("Take Profit on position: {0}", s.FinalTakeProfit.HasValue ? Fmt(s.FinalTakeProfit.Value) : "none");
-            return true;
+            Print("=========================================");
+            Print("TRADE OPENED");
+            Print("Direction: {0}", p.TradeType == TradeType.Buy ? "BUY" : "SELL");
+            Print("Entry Price: {0}", Fmt(p.EntryPrice));
+            Print("Stop Loss: {0}", Fmt(sl));
+            Print("Take Profit: {0}", p.TakeProfit.HasValue ? Fmt(p.TakeProfit.Value) : "none");
+            Print("Risk Distance: {0}", Fmt(riskDistance));
+            Print("Risk Percent: {0}%", RiskPercent.ToString("0.00", CultureInfo.InvariantCulture));
+            Print("Risk Amount: {0}", Money(riskAmount));
+            Print("Volume: {0}", p.VolumeInUnits);
+            Print("Risk/Reward: 1:{0}", RewardMultiple.ToString("0.##", CultureInfo.InvariantCulture));
+            Print("=========================================");
         }
 
-        private void ManageOpenPositions()
+        private void LogTradeClosed(Position p, PositionCloseReason reason)
+        {
+            var deal = History.Where(h => h.PositionId == p.Id).OrderBy(h => h.ClosingTime).LastOrDefault();
+            double exitPrice = deal != null ? deal.ClosingPrice : p.CurrentPrice;
+
+            string exitReason;
+            if (reason == PositionCloseReason.TakeProfit) exitReason = "TAKE PROFIT";
+            else if (reason == PositionCloseReason.StopLoss) exitReason = "STOP LOSS";
+            else exitReason = "OTHER (" + reason + ")";
+
+            Print("TRADE CLOSED");
+            Print("Position ID: {0}", p.Id);
+            Print("Direction: {0}", p.TradeType == TradeType.Buy ? "BUY" : "SELL");
+            Print("Entry: {0}", Fmt(p.EntryPrice));
+            Print("Exit: {0}", Fmt(exitPrice));
+            Print("Net P/L: {0}", Money(p.NetProfit));
+            Print("Exit Reason: {0}", exitReason);
+        }
+
+        // SAFETY ONLY (not trade management): a position must never stay open without a stop
+        // loss, because its risk would be unlimited instead of 1%. This can only happen when a
+        // limit order is filled beyond its own stop (price gaps through both levels). Positions
+        // that have their stop loss are never touched.
+        private void CheckUnprotectedPositions()
         {
             foreach (var p in Positions.Where(IsOwnPosition).ToList())
             {
-                if (!_positionStates.TryGetValue(p.Id, out var s))
+                if (p.StopLoss.HasValue)
                 {
-                    // e.g. the stop loss was attached after the Opened event
-                    if (!RegisterPosition(p, false))
-                    {
-                        CloseIfStillUnprotected(p);
-                        continue;
-                    }
-                    s = _positionStates[p.Id];
+                    _noStopSinceTick.Remove(p.Id);
+                    continue;
                 }
 
-                if (s.PartialTaken && s.BreakEvenActivated) continue;   // nothing left to do
-
-                bool isBuy = s.Direction == TradeType.Buy;
-                double price = isBuy ? Symbol.Bid : Symbol.Ask;
-
-                if (!s.OneRReached)
-                {
-                    bool reached = isBuy ? price >= s.OneRPrice : price <= s.OneRPrice;
-                    if (!reached) continue;
-
-                    s.OneRReached = true;
-                    TakePartialAndBreakEven(p, s, price);
-                }
-                else if (!s.BreakEvenActivated)
-                {
-                    // Only reached if the first break-even modification failed.
-                    MoveToBreakEven(p, s);
-                }
+                WarnNoStop(p);
+                CloseIfStillUnprotected(p);
             }
         }
 
-        private void TakePartialAndBreakEven(Position p, PositionState s, double price)
+        private void WarnNoStop(Position p)
         {
-            // 50% of the ORIGINAL volume, normalized to the broker's volume step.
-            double closeVolume = Symbol.NormalizeVolumeInUnits(s.OriginalVolume / 2.0, RoundingMode.ToNearest);
-            double currentVolume = p.VolumeInUnits;
-            double remaining = Math.Round(currentVolume - closeVolume, 8);
-
-            bool canSplit = closeVolume >= Symbol.VolumeInUnitsMin
-                            && closeVolume < currentVolume
-                            && remaining >= Symbol.VolumeInUnitsMin - 1e-9;
-
-            // Mark as done BEFORE sending, so the partial close is never repeated on later ticks.
-            s.PartialTaken = true;
-
-            Print("---------------- 1R TARGET REACHED ----------------");
-            Print("Position ID: {0}", s.PositionId);
-            Print("Price: {0}", Fmt(price));
-
-            if (canSplit)
-            {
-                Print("Closing 50%: {0} of original {1}", closeVolume, s.OriginalVolume);
-                Print("Remaining Volume: {0}", remaining);
-
-                var result = ClosePosition(p, closeVolume);
-                if (!result.IsSuccessful)
-                    Print("Partial close FAILED: {0} (it will not be retried)", result.Error);
-            }
-            else
-            {
-                Print("Closing 50%: SKIPPED - volume {0} cannot be split into two valid sizes " +
-                      "(min {1}, step {2}). Full position stays open.",
-                      currentVolume, Symbol.VolumeInUnitsMin, Symbol.VolumeInUnitsStep);
-                Print("Remaining Volume: {0}", currentVolume);
-            }
-
-            Print("Moving SL to Break Even: {0}", Fmt(s.OriginalEntry));
-            Print("Final TP: {0}", s.FinalTakeProfit.HasValue ? Fmt(s.FinalTakeProfit.Value) : Fmt(s.TargetPrice));
-
-            MoveToBreakEven(p, s);
+            if (!_noStopWarned.Add(p.Id)) return;
+            _noStopSinceTick[p.Id] = _tickCount;
+            Print("WARNING: position {0} has NO stop loss (e.g. filled through the stop on a price gap). {1}",
+                p.Id, CloseUnprotectedPositions
+                    ? "It will be closed if no stop loss is attached by the next tick."
+                    : "'Close Positions Without Stop Loss' is OFF - the position is UNPROTECTED.");
         }
 
-        private void MoveToBreakEven(Position p, PositionState s)
-        {
-            if (s.BreakEvenActivated || s.BreakEvenAttempts >= 3) return;
-            s.BreakEvenAttempts++;
-
-            bool isBuy = s.Direction == TradeType.Buy;
-            double be = Math.Round(s.OriginalEntry, Symbol.Digits);
-
-            // If price has already fallen back through the entry, a break-even stop would be
-            // on the wrong side of the market - close the runner instead (same outcome as BE).
-            bool invalid = isBuy ? Symbol.Bid <= be : Symbol.Ask >= be;
-            if (invalid)
-            {
-                s.BreakEvenActivated = true;
-                Print("Price is already back at/through break even ({0}) - closing the remaining position.", Fmt(be));
-                var closeResult = ClosePosition(p);
-                if (!closeResult.IsSuccessful)
-                    Print("Closing remaining position FAILED: {0}", closeResult.Error);
-                return;
-            }
-
-            var result = p.ModifyStopLossPrice(be);
-            if (result.IsSuccessful)
-            {
-                s.BreakEvenActivated = true;
-                Print("Position {0}: SL moved to break even at {1}. TP stays at {2}.", s.PositionId, Fmt(be),
-                    p.TakeProfit.HasValue ? Fmt(p.TakeProfit.Value) : "none");
-
-                // The final target must remain the original take profit.
-                if (!p.TakeProfit.HasValue)
-                {
-                    double tp = s.FinalTakeProfit ?? s.TargetPrice;
-                    var tpResult = p.ModifyTakeProfitPrice(Math.Round(tp, Symbol.Digits));
-                    if (!tpResult.IsSuccessful)
-                        Print("Restoring TP FAILED: {0}", tpResult.Error);
-                }
-            }
-            else
-            {
-                Print("Break-even modification FAILED (attempt {0}/3): {1}", s.BreakEvenAttempts, result.Error);
-            }
-        }
-
-        private void LogFinalExit(Position p, PositionCloseReason reason)
-        {
-            if (!_positionStates.TryGetValue(p.Id, out var s)) return;
-
-            var deals = History.Where(h => h.PositionId == p.Id).OrderBy(h => h.ClosingTime).ToList();
-            double finalPrice = deals.Count > 0 ? deals.Last().ClosingPrice : p.CurrentPrice;
-            double totalNet = deals.Sum(h => h.NetProfit);
-
-            string exitReason;
-            if (reason == PositionCloseReason.TakeProfit)
-                exitReason = RewardRatio + "R Take Profit";
-            else if (reason == PositionCloseReason.StopLoss)
-                exitReason = s.BreakEvenActivated ? "Break Even" : "Original Stop Loss (before 1R)";
-            else
-                exitReason = "Other (" + reason + ")";
-
-            Print("---------------- {0} ----------------", s.PartialTaken ? "RUNNER CLOSED" : "TRADE CLOSED");
-            Print("Position ID: {0}", s.PositionId);
-            Print("Exit Reason: {0}", exitReason);
-            Print("Final Price: {0}", Fmt(finalPrice));
-            Print("Total trade net profit (partial + runner): {0:0.00}", totalNet);
-
-            _positionStates.Remove(p.Id);
-            _noStopWarned.Remove(p.Id);
-            _noStopSinceTick.Remove(p.Id);
-        }
-
-        // SAFETY: a position of this bot must never stay open without a stop loss.
-        // This happens when a limit order is filled beyond its own stop (price gaps through
-        // both levels, e.g. on news). Such a fill has already broken the setup's level 1,
-        // so the setup is invalid and the position is closed at market.
         private void CloseIfStillUnprotected(Position p)
         {
             if (!CloseUnprotectedPositions || p.StopLoss.HasValue) return;
