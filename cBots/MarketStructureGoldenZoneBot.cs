@@ -1282,7 +1282,7 @@ namespace cAlgo.Robots
                 {
                     // Header set per request: the shared HttpClient's default headers must not be
                     // changed while another bot instance may be using it.
-                    using (var request = new HttpRequestMessage(HttpMethod.Get, url))
+                    using (var request = new HttpRequestMessage(System.Net.Http.HttpMethod.Get, url))
                     {
                         request.Headers.TryAddWithoutValidation("User-Agent",
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36");
