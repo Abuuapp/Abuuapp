@@ -30,8 +30,8 @@
 //   - At +1R (Bid for buys, Ask for sells), ONCE per position:
 //       * close 50% of the ORIGINAL volume (normalized to broker steps),
 //       * move the stop on the remaining volume to the original entry,
-//       * keep the original 2R take profit.
-//   - The runner then exits at the 2R take profit or at break even.
+//       * keep the original take profit (Risk:Reward x 1R, default 2R).
+//   - The runner then exits at that take profit or at break even.
 //
 //  NEWS FILTER (live trading only)
 //   - Downloads the Forex Factory weekly calendar (JSON) every few hours.
@@ -146,7 +146,7 @@ namespace cAlgo.Robots
         public double OriginalRisk;        // price distance entry -> original SL
         public double OriginalVolume;      // units, BEFORE any partial close
         public double OneRPrice;
-        public double TwoRPrice;
+        public double TargetPrice;         // entry +/- RewardRatio x risk
         public double? FinalTakeProfit;    // the take profit the position was opened with
         public bool OneRReached;
         public bool PartialTaken;          // true once the 50% close has been ATTEMPTED (never retried)
@@ -320,11 +320,25 @@ namespace cAlgo.Robots
             // Monthly target: restore or start this month's state BEFORE any order can be placed.
             InitMonthlyTarget();
 
+            // News filter first, so a setup is not placed inside a news window at start-up.
+            InitNewsFilter();
+            if (NewsFilterOn) UpdateNewsState();
+
+            WarnIfMinStopTooLarge();
+
             // If the latest setup is still waiting for price, place its order now.
             if (Trend == StructureTrend.Bullish) TryPlaceOrder(ActiveBullFib);
             if (Trend == StructureTrend.Bearish) TryPlaceOrder(ActiveBearFib);
+        }
 
-            InitNewsFilter();
+        // 'Min Stop Distance' is in raw price units: 40 is sensible on indices, but on forex
+        // (price ~1.1) it blocks every trade.
+        private void WarnIfMinStopTooLarge()
+        {
+            if (MinStopDistance > 0 && MinStopDistance > Symbol.Bid * 0.02)
+                Print("WARNING: 'Min Stop Distance' = {0} price units is more than 2% of the price ({1}). " +
+                      "Almost every setup on {2} will be skipped - lower it (e.g. 0 = off).",
+                    Fmt(MinStopDistance), Fmt(Symbol.Bid), SymbolName);
         }
 
         protected override void OnTimer()
@@ -554,7 +568,7 @@ namespace cAlgo.Robots
             DrawFib(f);
 
             // The Fib is confirmed a few bars after the HH/LL: check those bars too.
-            for (int k = zero.Index + 1; k < currentIndex; k++)
+            for (int k = zero.Index + 1; k <= currentIndex; k++)
                 CheckFib(f, k);
 
             // STEP 3: place the order at 0.62 (live only, not while rebuilding history)
@@ -631,20 +645,22 @@ namespace cAlgo.Robots
                 return;
             }
 
-            f.TradeAttempted = true;
-
             int open = Positions.Count(p => p.Label == TradeLabel && p.SymbolName == SymbolName);
             if (open >= MaxOpenTrades)
             {
-                Print("Skipped {0} setup: already {1} open trade(s).", f.IsBullish ? "BUY" : "SELL", open);
+                // Not marked as attempted: the setup is retried when a position closes.
+                Print("{0} setup waiting: already {1} open trade(s).", f.IsBullish ? "BUY" : "SELL", open);
                 return;
             }
 
+            f.TradeAttempted = true;
+
             var type = f.IsBullish ? TradeType.Buy : TradeType.Sell;
-            double entry = f.PriceAt(GoldenStart);          // 0.62
+            double entry = Math.Round(f.PriceAt(GoldenStart), Symbol.Digits);   // 0.62
             double buffer = StopBufferPips * Symbol.PipSize;
-            double stop = f.IsBullish ? f.PriceAt(StopLevel) - buffer   // level 1 = HL
-                                      : f.PriceAt(StopLevel) + buffer;  // level 1 = LH
+            double stop = Math.Round(f.IsBullish ? f.PriceAt(StopLevel) - buffer   // level 1 = HL
+                                                 : f.PriceAt(StopLevel) + buffer,  // level 1 = LH
+                                     Symbol.Digits);
 
             // If price is already at/through 0.62, enter at market; otherwise wait with a limit order.
             double market = f.IsBullish ? Symbol.Ask : Symbol.Bid;
@@ -677,7 +693,7 @@ namespace cAlgo.Robots
             TradeResult result = useMarket
                 ? ExecuteMarketOrder(type, SymbolName, volume, TradeLabel, slPips, tpPips)
                 : PlaceLimitOrder(type, SymbolName, volume, entry, TradeLabel,
-                    Math.Round(stop, Symbol.Digits), Math.Round(target, Symbol.Digits), ProtectionType.Absolute);
+                    stop, Math.Round(target, Symbol.Digits), ProtectionType.Absolute);
 
             if (!result.IsSuccessful)
             {
@@ -719,22 +735,32 @@ namespace cAlgo.Robots
             return Math.Min(units, Symbol.VolumeInUnitsMax);
         }
 
-        private void CancelFibOrder(FibSetup f, string reason)
+        // Returns true only if a still-pending order was cancelled (not one that already filled).
+        private bool CancelFibOrder(FibSetup f, string reason)
         {
-            if (f == null || f.Order == null) return;
+            if (f == null || f.Order == null) return false;
 
+            bool cancelled = false;
             var order = PendingOrders.FirstOrDefault(o => o.Id == f.Order.Id);
             if (order != null)
             {
-                CancelPendingOrder(order);
+                cancelled = CancelPendingOrder(order).IsSuccessful;
                 Print("Cancelled pending {0} order: {1}", order.TradeType, reason);
             }
             f.Order = null;
+            return cancelled;
         }
 
         private void OnOrderFilled(PendingOrderFilledEventArgs args)
         {
             if (args.Position.Label != TradeLabel) return;
+
+            // The setup is traded: forget the order so a later cancel (news / monthly lock)
+            // can never re-arm the same setup and open a second trade.
+            foreach (var f in new[] { ActiveBullFib, ActiveBearFib })
+                if (f != null && f.Order != null && f.Order.Id == args.PendingOrder.Id)
+                    f.Order = null;
+
             Print("Order FILLED: {0} at {1} | SL {2} | TP {3}", args.Position.TradeType,
                 Fmt(args.Position.EntryPrice), Fmt(args.Position.StopLoss ?? 0), Fmt(args.Position.TakeProfit ?? 0));
         }
@@ -749,11 +775,15 @@ namespace cAlgo.Robots
             CheckMonthlyTarget();
             _noStopWarned.Remove(args.Position.Id);
             _noStopSinceTick.Remove(args.Position.Id);
+
+            // A trade slot is free: a setup that was waiting for it may now be placed.
+            if (Trend == StructureTrend.Bullish) TryPlaceOrder(ActiveBullFib);
+            if (Trend == StructureTrend.Bearish) TryPlaceOrder(ActiveBearFib);
         }
 
         // =====================================================================
         //  STEP 4 - Open-trade management: 50% at +1R, runner to break even,
-        //  final exit at the original 2R take profit or at break even.
+        //  final exit at the original take profit or at break even.
         // =====================================================================
         private readonly HashSet<int> _noStopWarned = new HashSet<int>();
         private readonly Dictionary<int, long> _noStopSinceTick = new Dictionary<int, long>();
@@ -801,7 +831,7 @@ namespace cAlgo.Robots
                 OriginalRisk = risk,
                 OriginalVolume = p.VolumeInUnits,
                 OneRPrice = isBuy ? entry + risk : entry - risk,
-                TwoRPrice = isBuy ? entry + 2 * risk : entry - 2 * risk,
+                TargetPrice = isBuy ? entry + RewardRatio * risk : entry - RewardRatio * risk,
                 FinalTakeProfit = p.TakeProfit
             };
 
@@ -828,7 +858,7 @@ namespace cAlgo.Robots
             Print("Original Risk (1R distance): {0}", Fmt(s.OriginalRisk));
             Print("Original Volume: {0}", s.OriginalVolume);
             Print("1R Level: {0}", Fmt(s.OneRPrice));
-            Print("2R Level: {0}", Fmt(s.TwoRPrice));
+            Print("{0}R Level: {1}", RewardRatio, Fmt(s.TargetPrice));
             Print("Take Profit on position: {0}", s.FinalTakeProfit.HasValue ? Fmt(s.FinalTakeProfit.Value) : "none");
             return true;
         }
@@ -905,7 +935,7 @@ namespace cAlgo.Robots
             }
 
             Print("Moving SL to Break Even: {0}", Fmt(s.OriginalEntry));
-            Print("Final TP: {0}", s.FinalTakeProfit.HasValue ? Fmt(s.FinalTakeProfit.Value) : Fmt(s.TwoRPrice));
+            Print("Final TP: {0}", s.FinalTakeProfit.HasValue ? Fmt(s.FinalTakeProfit.Value) : Fmt(s.TargetPrice));
 
             MoveToBreakEven(p, s);
         }
@@ -938,10 +968,10 @@ namespace cAlgo.Robots
                 Print("Position {0}: SL moved to break even at {1}. TP stays at {2}.", s.PositionId, Fmt(be),
                     p.TakeProfit.HasValue ? Fmt(p.TakeProfit.Value) : "none");
 
-                // The final target must remain the original 2R take profit.
+                // The final target must remain the original take profit.
                 if (!p.TakeProfit.HasValue)
                 {
-                    double tp = s.FinalTakeProfit ?? s.TwoRPrice;
+                    double tp = s.FinalTakeProfit ?? s.TargetPrice;
                     var tpResult = p.ModifyTakeProfitPrice(Math.Round(tp, Symbol.Digits));
                     if (!tpResult.IsSuccessful)
                         Print("Restoring TP FAILED: {0}", tpResult.Error);
@@ -963,7 +993,7 @@ namespace cAlgo.Robots
 
             string exitReason;
             if (reason == PositionCloseReason.TakeProfit)
-                exitReason = "2R Take Profit";
+                exitReason = RewardRatio + "R Take Profit";
             else if (reason == PositionCloseReason.StopLoss)
                 exitReason = s.BreakEvenActivated ? "Break Even" : "Original Stop Loss (before 1R)";
             else
@@ -1044,10 +1074,6 @@ namespace cAlgo.Robots
 
             _newsActive = true;
 
-            if (!_http.DefaultRequestHeaders.Contains("User-Agent"))
-                _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36");
-
             // Use the cached copy if it is recent - the feed is rate limited.
             bool usedCache = false;
             try
@@ -1090,8 +1116,19 @@ namespace cAlgo.Robots
             {
                 try
                 {
-                    string body = await _http.GetStringAsync(url).ConfigureAwait(false);
-                    BeginInvokeOnMainThread(() => OnCalendarDownloaded(body, null));
+                    // Header set per request: the shared HttpClient's default headers must not be
+                    // changed while another bot instance may be using it.
+                    using (var request = new HttpRequestMessage(HttpMethod.Get, url))
+                    {
+                        request.Headers.TryAddWithoutValidation("User-Agent",
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36");
+                        using (var response = await _http.SendAsync(request).ConfigureAwait(false))
+                        {
+                            response.EnsureSuccessStatusCode();
+                            string body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                            BeginInvokeOnMainThread(() => OnCalendarDownloaded(body, null));
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1308,11 +1345,8 @@ namespace cAlgo.Robots
                 // Pending orders are exactly what a news spike fills at a bad price.
                 foreach (var f in new[] { ActiveBullFib, ActiveBearFib })
                 {
-                    if (f != null && f.Order != null)
-                    {
-                        CancelFibOrder(f, "news window");
+                    if (CancelFibOrder(f, "news window"))
                         f.TradeAttempted = false;          // allow it to be placed again after the news
-                    }
                 }
                 foreach (var o in PendingOrders.Where(o => o.Label == TradeLabel && o.SymbolName == SymbolName).ToList())
                     CancelPendingOrder(o);
@@ -1509,11 +1543,8 @@ namespace cAlgo.Robots
         {
             foreach (var f in new[] { ActiveBullFib, ActiveBearFib })
             {
-                if (f != null && f.Order != null)
-                {
-                    CancelFibOrder(f, "monthly profit target reached");
+                if (CancelFibOrder(f, "monthly profit target reached"))
                     f.TradeAttempted = false;   // may be placed again next month if still valid
-                }
             }
 
             foreach (var o in PendingOrders.Where(o => o.Label == TradeLabel && o.SymbolName == SymbolName).ToList())
