@@ -2,13 +2,24 @@
 //  Market Structure Golden Zone Bot
 //  Platform: cTrader Automate (cAlgo API, C#)
 //
-//  STEP 1 - Market structure
-//   - Swing highs / lows are fractal pivots (N bars lower/higher on each side).
-//   - BULLISH break: price breaks above the latest swing high.
-//        -> lowest low before the break = HL, peak after the break = HH
-//   - BEARISH break: price breaks below the latest swing low.
-//        -> highest high before the break = LH, trough after the break = LL
-//   - Break WITH the trend = BOS, AGAINST the trend = CHoCH.
+//  STEP 1 - Market structure (significant swings + consolidation filter)
+//   - Candidate swings are fractal pivots on CLOSED candles (N bars each side).
+//   - A pivot only becomes a significant swing if it moved at least
+//     ATR x 'Minimum Swing Size ATR' from the previous significant swing and
+//     is at least 'Minimum Swing Bars' bars after it. Highs and lows alternate;
+//     a further pivot of the same type extends the current swing. Small pivots
+//     are ignored: no swing, no HH/HL/LH/LL label.
+//   - State from the last two significant highs and lows:
+//       BULLISH       HH + HL, both by >= 'Minimum Structure Expansion ATR',
+//                     and the HL still intact (no close below it)
+//       BEARISH       LL + LH, same rules mirrored
+//       CONSOLIDATING structure range (highest of the 2 highs - lowest of the
+//                     2 lows) < ATR x 'Minimum Trend Range ATR', or highs and
+//                     lows overlapping (flat) or contracting (LH + HL)
+//       NEUTRAL       mixed structure (e.g. HH + LL) or the HL / LH broken
+//       UNKNOWN       fewer than 2 significant highs and 2 lows
+//   - Only BULLISH allows BUY setups and only BEARISH allows SELL setups.
+//   - Break of the latest significant swing is drawn as BOS / CHoCH.
 //
 //  STEP 2 - Fibonacci golden zone
 //   - HH confirmed -> Fib from HL (level 1) to HH (level 0).
@@ -17,13 +28,13 @@
 //   - Golden zone = 0.62 -> 0.79.
 //
 //  STEP 3 - Trade execution
-//   - Trend HH/HL (bullish): BUY LIMIT at the 0.62 level.
-//   - Trend LH/LL (bearish): SELL LIMIT at the 0.62 level.
+//   - BULLISH structure: BUY LIMIT at the 0.62 level.
+//   - BEARISH structure: SELL LIMIT at the 0.62 level.
 //   - Stop loss at Fib level 1 (the HL for buys, the LH for sells).
 //   - Take profit = exactly 2 x the stop distance (1:2), set when the order is placed.
 //   - Volume = 1% (Risk %) of the CURRENT account BALANCE at the stop loss.
 //   - The pending order is cancelled if the setup is invalidated,
-//     replaced by a newer Fib, or the trend flips.
+//     replaced by a newer Fib, or the structure stops allowing that direction.
 //
 //  STEP 4 - No trade management
 //   - Every position stays FULLY open with its ORIGINAL stop loss and ORIGINAL
@@ -61,6 +72,7 @@ using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using cAlgo.API;
+using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
 
 namespace cAlgo.Robots
@@ -71,11 +83,13 @@ namespace cAlgo.Robots
         Wick
     }
 
-    public enum StructureTrend
+    public enum MarketStructure
     {
-        None,
+        Unknown,
         Bullish,
-        Bearish
+        Bearish,
+        Consolidating,
+        Neutral
     }
 
     public enum NewsImpactFilter
@@ -98,6 +112,7 @@ namespace cAlgo.Robots
         public double Price;
         public DateTime Time;
         public string Label = "";
+        public bool IsHigh;
         public bool Broken;
 
         public SwingPoint(int index, double price, DateTime time)
@@ -136,6 +151,21 @@ namespace cAlgo.Robots
 
         [Parameter("Break Confirmation", DefaultValue = BreakConfirmation.CandleClose, Group = "Structure")]
         public BreakConfirmation BreakMode { get; set; }
+
+        [Parameter("Minimum Swing Size ATR", DefaultValue = 1.0, MinValue = 0.1, Group = "Structure")]
+        public double MinimumSwingSizeATR { get; set; }
+
+        [Parameter("Minimum Swing Bars", DefaultValue = 3, MinValue = 1, Group = "Structure")]
+        public int MinimumSwingBars { get; set; }
+
+        [Parameter("Minimum Trend Range ATR", DefaultValue = 3.0, MinValue = 0.5, Group = "Structure")]
+        public double MinimumTrendRangeATR { get; set; }
+
+        [Parameter("Minimum Structure Expansion ATR", DefaultValue = 0.5, MinValue = 0.0, Group = "Structure")]
+        public double MinimumStructureExpansionATR { get; set; }
+
+        [Parameter("ATR Period", DefaultValue = 14, MinValue = 1, Group = "Structure")]
+        public int AtrPeriod { get; set; }
 
         // ---------------- Fibonacci ----------------
         [Parameter("Fib Levels", DefaultValue = "0,0.62,0.705,0.79,1,-0.27,-0.62,-2", Group = "Fibonacci")]
@@ -227,7 +257,7 @@ namespace cAlgo.Robots
         public bool PrintToLog { get; set; }
 
         // ---------------- Public state ----------------
-        public StructureTrend Trend { get; private set; } = StructureTrend.None;
+        public MarketStructure CurrentStructure { get; private set; } = MarketStructure.Unknown;
         public SwingPoint LastHH { get; private set; }
         public SwingPoint LastHL { get; private set; }
         public SwingPoint LastLH { get; private set; }
@@ -236,19 +266,15 @@ namespace cAlgo.Robots
         public FibSetup ActiveBearFib { get; private set; }
 
         // ---------------- Internal state ----------------
-        private SwingPoint _swingHigh;
-        private SwingPoint _swingLow;
+        private AverageTrueRange _atr;
+        private readonly List<SwingPoint> _swings = new List<SwingPoint>();   // significant swings, alternating H/L
+        private double _structureAtr = double.NaN;                            // ATR when the swings last changed
+        private string _structureReason = "";
 
-        private bool _pendingHH;
-        private double _brokenHighLevel;
-        private int _hhSearchFrom;
-
-        private bool _pendingLL;
-        private double _brokenLowLevel;
-        private int _llSearchFrom;
+        // Fib to draw once the structure state of the bar is known (set when a new HH / LL appears).
+        private SwingPoint _pendBullOne, _pendBullZero, _pendBearOne, _pendBearZero;
 
         private bool _loadingHistory;
-        private readonly Dictionary<string, string> _labels = new Dictionary<string, string>();
         private readonly List<double> _fibLevels = new List<double>();
 
         // Take profit = 2 x the original stop distance (fixed 1:2 risk-to-reward).
@@ -274,13 +300,15 @@ namespace cAlgo.Robots
             foreach (var o in PendingOrders.Where(o => o.Label == TradeLabel && o.SymbolName == SymbolName).ToList())
                 CancelPendingOrder(o);
 
+            _atr = Indicators.AverageTrueRange(AtrPeriod, MovingAverageType.WilderSmoothing);
+
             _loadingHistory = true;
             for (int i = 0; i < Bars.Count - 1; i++)
                 ProcessBar(i);
             _loadingHistory = false;
 
-            Print("Bot started. Trend: {0}. Fib levels: {1}. Trading: {2}",
-                Trend, string.Join(", ", _fibLevels), EnableTrading ? "ON" : "OFF");
+            Print("Bot started. Market structure: {0} ({1}). Fib levels: {2}. Trading: {3}",
+                Upper(CurrentStructure), _structureReason, string.Join(", ", _fibLevels), EnableTrading ? "ON" : "OFF");
 
             // Monthly target: restore or start this month's state BEFORE any order can be placed.
             InitMonthlyTarget();
@@ -292,8 +320,7 @@ namespace cAlgo.Robots
             WarnIfMinStopTooLarge();
 
             // If the latest setup is still waiting for price, place its order now.
-            if (Trend == StructureTrend.Bullish) TryPlaceOrder(ActiveBullFib);
-            if (Trend == StructureTrend.Bearish) TryPlaceOrder(ActiveBearFib);
+            PlaceOrderForStructure();
         }
 
         // 'Min Stop Distance' is in raw price units: 40 is sensible on indices, but on forex
@@ -351,28 +378,67 @@ namespace cAlgo.Robots
         }
 
         // =====================================================================
-        //  Core processing
+        //  STEP 1 - Market structure from SIGNIFICANT swings only
+        //
+        //  Candidates are fractal pivots on CLOSED candles (SwingStrength bars on
+        //  each side). A candidate becomes a significant swing only when:
+        //    - it is the opposite type of the last significant swing (highs and
+        //      lows alternate),
+        //    - price moved at least ATR x MinimumSwingSizeATR away from the last
+        //      significant swing, and
+        //    - it is at least MinimumSwingBars bars after the last significant swing.
+        //  A candidate of the SAME type that goes further (higher high / lower low)
+        //  before a valid opposite swing exists extends the current swing.
+        //  Everything else is ignored: no swing, no label, no structure change.
         // =====================================================================
         private void ProcessBar(int i)
         {
+            bool swingsChanged = false;
             int p = i - SwingStrength;
             if (p - SwingStrength >= 0)
             {
-                if (IsPivotHigh(p)) OnPivotHigh(p, i);
-                if (IsPivotLow(p)) OnPivotLow(p, i);
+                bool isHigh = IsPivotHigh(p);
+                bool isLow = IsPivotLow(p);
+
+                // Outside bar that is both: handle the type that continues the zigzag first.
+                bool highFirst = LastSwing == null || !LastSwing.IsHigh;
+                if (highFirst)
+                {
+                    if (isHigh) swingsChanged |= OnCandidateSwing(true, p, i);
+                    if (isLow) swingsChanged |= OnCandidateSwing(false, p, i);
+                }
+                else
+                {
+                    if (isLow) swingsChanged |= OnCandidateSwing(false, p, i);
+                    if (isHigh) swingsChanged |= OnCandidateSwing(true, p, i);
+                }
             }
 
-            double upPrice = BreakMode == BreakConfirmation.CandleClose ? Bars.ClosePrices[i] : Bars.HighPrices[i];
-            double downPrice = BreakMode == BreakConfirmation.CandleClose ? Bars.ClosePrices[i] : Bars.LowPrices[i];
+            if (swingsChanged) _structureAtr = AtrAt(i);
 
-            if (_swingHigh != null && !_swingHigh.Broken && upPrice > _swingHigh.Price)
-                BullishBreak(i);
+            bool brokeStructure = CheckStructureBreaks(i);
+            bool stateEnabledEntries = UpdateStructureState(i, swingsChanged, swingsChanged || brokeStructure);
 
-            if (_swingLow != null && !_swingLow.Broken && downPrice < _swingLow.Price)
-                BearishBreak(i);
+            // STEP 2: a new HH / LL draws its Fib (after the structure state is up to date).
+            bool newFib = false;
+            if (_pendBullZero != null)
+            {
+                CreateFib(true, _pendBullOne, _pendBullZero, i);
+                newFib = true;
+            }
+            if (_pendBearZero != null)
+            {
+                CreateFib(false, _pendBearOne, _pendBearZero, i);
+                newFib = true;
+            }
+            _pendBullOne = _pendBullZero = _pendBearOne = _pendBearZero = null;
 
             CheckFib(ActiveBullFib, i);
             CheckFib(ActiveBearFib, i);
+
+            // STEP 3: place the order at 0.62 (live only, not while rebuilding history).
+            if (!_loadingHistory && (newFib || stateEnabledEntries))
+                PlaceOrderForStructure();
         }
 
         private bool IsPivotHigh(int p)
@@ -397,106 +463,341 @@ namespace cAlgo.Robots
             return true;
         }
 
-        private void OnPivotHigh(int p, int currentIndex)
+        private double AtrAt(int i)
         {
-            if (_swingHigh != null && p <= _swingHigh.Index) return;
+            if (_atr == null || i < 0) return double.NaN;
+            return _atr.Result[i];
+        }
 
-            if (_pendingHH && p >= _hhSearchFrom && Bars.HighPrices[p] > _brokenHighLevel)
+        private SwingPoint LastSwing => _swings.Count > 0 ? _swings[_swings.Count - 1] : null;
+
+        // n = 0: latest swing of that type, n = 1: the one before it, ...
+        private SwingPoint NthLatest(bool isHigh, int n)
+        {
+            for (int k = _swings.Count - 1; k >= 0; k--)
             {
-                ResolvePendingHH(p, currentIndex, true);
+                if (_swings[k].IsHigh != isHigh) continue;
+                if (n == 0) return _swings[k];
+                n--;
+            }
+            return null;
+        }
+
+        // Returns true if the significant swings changed.
+        private bool OnCandidateSwing(bool isHigh, int p, int i)
+        {
+            double price = isHigh ? Bars.HighPrices[p] : Bars.LowPrices[p];
+            var last = LastSwing;
+
+            if (last == null)
+            {
+                AddSwing(isHigh, p, price);
+                return true;
+            }
+
+            if (p <= last.Index) return false;
+
+            if (last.IsHigh == isHigh)
+            {
+                // Same type: only a pivot that goes further extends the current swing.
+                bool further = isHigh ? price > last.Price : price < last.Price;
+                if (!further) return false;
+                ExtendLastSwing(p, price);
+                return true;
+            }
+
+            double atr = AtrAt(i);
+            if (double.IsNaN(atr) || atr <= 0) return false;
+
+            // Swing significance filter: too small a move is ignored completely.
+            if (Math.Abs(price - last.Price) < atr * MinimumSwingSizeATR) return false;
+
+            // Minimum swing distance: too close to the previous significant swing.
+            if (p - last.Index < MinimumSwingBars) return false;
+
+            AddSwing(isHigh, p, price);
+            return true;
+        }
+
+        private void AddSwing(bool isHigh, int p, double price)
+        {
+            var sp = new SwingPoint(p, price, Bars.OpenTimes[p]) { IsHigh = isHigh };
+            _swings.Add(sp);
+            if (_swings.Count > 100) _swings.RemoveAt(0);
+            ClassifySwing(sp);
+        }
+
+        // The current (latest) swing moves to a more extreme confirmed pivot of the same type.
+        private void ExtendLastSwing(int p, double price)
+        {
+            var old = LastSwing;
+            RemoveSwingLabel(old);
+            var sp = new SwingPoint(p, price, Bars.OpenTimes[p]) { IsHigh = old.IsHigh };
+            _swings[_swings.Count - 1] = sp;
+            ClassifySwing(sp);
+        }
+
+        private void ClassifySwing(SwingPoint sp)
+        {
+            var prevSame = NthLatest(sp.IsHigh, 1);
+            SwingPoint before = _swings.Count >= 2 ? _swings[_swings.Count - 2] : null;   // the opposite swing before sp
+
+            if (prevSame == null)
+            {
+                sp.Label = "";
                 return;
             }
 
-            _swingHigh = new SwingPoint(p, Bars.HighPrices[p], Bars.OpenTimes[p]);
-        }
-
-        private void OnPivotLow(int p, int currentIndex)
-        {
-            if (_swingLow != null && p <= _swingLow.Index) return;
-
-            if (_pendingLL && p >= _llSearchFrom && Bars.LowPrices[p] < _brokenLowLevel)
+            if (sp.IsHigh)
             {
-                ResolvePendingLL(p, currentIndex, true);
-                return;
+                sp.Label = sp.Price > prevSame.Price ? "HH" : "LH";
+                if (sp.Label == "HH")
+                {
+                    LastHH = sp;
+                    if (before != null && !before.IsHigh)
+                    {
+                        _pendBullOne = before;   // Fib level 1 = the swing low before the HH
+                        _pendBullZero = sp;      // Fib level 0 = the HH
+                    }
+                }
+                else
+                {
+                    LastLH = sp;
+                }
+            }
+            else
+            {
+                sp.Label = sp.Price < prevSame.Price ? "LL" : "HL";
+                if (sp.Label == "LL")
+                {
+                    LastLL = sp;
+                    if (before != null && before.IsHigh)
+                    {
+                        _pendBearOne = before;   // Fib level 1 = the swing high before the LL
+                        _pendBearZero = sp;      // Fib level 0 = the LL
+                    }
+                }
+                else
+                {
+                    LastHL = sp;
+                }
             }
 
-            _swingLow = new SwingPoint(p, Bars.LowPrices[p], Bars.OpenTimes[p]);
+            DrawSwingLabel(sp);
         }
 
-        private void BullishBreak(int i)
+        // A closed candle beyond the latest significant swing high / low. Drawn as BOS / CHoCH.
+        // A broken HL (bullish) or LH (bearish) means the structure is no longer intact.
+        private bool CheckStructureBreaks(int i)
         {
-            var broken = _swingHigh;
-            broken.Broken = true;
-            bool isChoch = Trend == StructureTrend.Bearish;
+            bool changed = false;
+            double upPrice = BreakMode == BreakConfirmation.CandleClose ? Bars.ClosePrices[i] : Bars.HighPrices[i];
+            double downPrice = BreakMode == BreakConfirmation.CandleClose ? Bars.ClosePrices[i] : Bars.LowPrices[i];
 
-            if (_pendingLL) ResolvePendingLL(i, i, false);
+            var h = NthLatest(true, 0);
+            if (h != null && !h.Broken && i > h.Index && upPrice > h.Price)
+            {
+                h.Broken = true;
+                changed = true;
+                DrawBreak(h, i, BreakText(true), true);
+            }
 
-            int lowIdx = LowestIndex(broken.Index + 1, i);
-            var hl = new SwingPoint(lowIdx, Bars.LowPrices[lowIdx], Bars.OpenTimes[lowIdx]);
-            Mark(hl, "HL", false);
-            LastHL = hl;
-            _swingLow = hl;
-
-            Trend = StructureTrend.Bullish;
-            DrawBreak(broken, i, isChoch ? "CHoCH" : "BOS", true);
-
-            // Trend is now bullish -> any waiting SELL order is no longer valid.
-            CancelFibOrder(ActiveBearFib, "trend turned bullish");
-
-            _pendingHH = true;
-            _brokenHighLevel = broken.Price;
-            _hhSearchFrom = broken.Index + 1;
+            var l = NthLatest(false, 0);
+            if (l != null && !l.Broken && i > l.Index && downPrice < l.Price)
+            {
+                l.Broken = true;
+                changed = true;
+                DrawBreak(l, i, BreakText(false), false);
+            }
+            return changed;
         }
 
-        private void BearishBreak(int i)
+        private string BreakText(bool upward)
         {
-            var broken = _swingLow;
-            broken.Broken = true;
-            bool isChoch = Trend == StructureTrend.Bullish;
-
-            if (_pendingHH) ResolvePendingHH(i, i, false);
-
-            int highIdx = HighestIndex(broken.Index + 1, i);
-            var lh = new SwingPoint(highIdx, Bars.HighPrices[highIdx], Bars.OpenTimes[highIdx]);
-            Mark(lh, "LH", true);
-            LastLH = lh;
-            _swingHigh = lh;
-
-            Trend = StructureTrend.Bearish;
-            DrawBreak(broken, i, isChoch ? "CHoCH" : "BOS", false);
-
-            // Trend is now bearish -> any waiting BUY order is no longer valid.
-            CancelFibOrder(ActiveBullFib, "trend turned bearish");
-
-            _pendingLL = true;
-            _brokenLowLevel = broken.Price;
-            _llSearchFrom = broken.Index + 1;
+            if (CurrentStructure == MarketStructure.Bullish) return upward ? "BOS" : "CHoCH";
+            if (CurrentStructure == MarketStructure.Bearish) return upward ? "CHoCH" : "BOS";
+            return "BRK";
         }
 
-        private void ResolvePendingHH(int upTo, int currentIndex, bool createFib)
+        // Determines BULLISH / BEARISH / CONSOLIDATING / NEUTRAL / UNKNOWN from the last two
+        // significant highs and lows. ATR is taken when the swings last changed, so the state does
+        // not flicker with the current candle. Returns true if trend entries were just enabled.
+        private bool UpdateStructureState(int i, bool swingsChanged, bool evaluate)
         {
-            int idx = HighestIndex(_hhSearchFrom, upTo);
-            var hh = new SwingPoint(idx, Bars.HighPrices[idx], Bars.OpenTimes[idx]);
-            Mark(hh, "HH", true);
-            LastHH = hh;
-            if (_swingHigh == null || _swingHigh.Broken || idx > _swingHigh.Index)
-                _swingHigh = hh;
-            _pendingHH = false;
+            if (!evaluate) return false;
 
-            if (createFib) CreateFib(true, LastHL, hh, currentIndex);
+            var h0 = NthLatest(true, 0);
+            var h1 = NthLatest(true, 1);
+            var l0 = NthLatest(false, 0);
+            var l1 = NthLatest(false, 1);
+            double atr = _structureAtr;
+
+            var state = MarketStructure.Unknown;
+            string reason = "not enough significant swings yet (need 2 highs and 2 lows)";
+            double highDiff = double.NaN, lowDiff = double.NaN, range = double.NaN;
+
+            if (h0 != null && h1 != null && l0 != null && l1 != null && !double.IsNaN(atr) && atr > 0)
+            {
+                highDiff = h0.Price - h1.Price;
+                lowDiff = l0.Price - l1.Price;
+                range = Math.Max(h0.Price, h1.Price) - Math.Min(l0.Price, l1.Price);
+
+                double minRange = atr * MinimumTrendRangeATR;
+                double minExpansion = atr * MinimumStructureExpansionATR;
+                bool highsUp = highDiff >= minExpansion && highDiff > 0;
+                bool highsDown = highDiff <= -minExpansion && highDiff < 0;
+                bool lowsUp = lowDiff >= minExpansion && lowDiff > 0;
+                bool lowsDown = lowDiff <= -minExpansion && lowDiff < 0;
+
+                if (range < minRange)
+                {
+                    state = MarketStructure.Consolidating;
+                    reason = string.Format("Insufficient structural expansion - structure range {0} < {1} ({2} x ATR).",
+                        Fmt(range), Fmt(minRange), MinimumTrendRangeATR);
+                }
+                else if (!highsUp && !highsDown && !lowsUp && !lowsDown)
+                {
+                    state = MarketStructure.Consolidating;
+                    reason = "Excessive swing overlap - highs and lows stay in the same range (no meaningful HH/HL or LL/LH).";
+                }
+                else if (highsDown && lowsUp)
+                {
+                    state = MarketStructure.Consolidating;
+                    reason = "Excessive swing overlap - contracting range (lower highs with higher lows).";
+                }
+                else if (highsUp && lowsUp)
+                {
+                    if (l0.Broken)
+                    {
+                        state = MarketStructure.Neutral;
+                        reason = "HH + HL formed, but price has broken below the HL " + Fmt(l0.Price) + ".";
+                    }
+                    else
+                    {
+                        state = MarketStructure.Bullish;
+                        reason = "HH + HL with meaningful expansion.";
+                    }
+                }
+                else if (highsDown && lowsDown)
+                {
+                    if (h0.Broken)
+                    {
+                        state = MarketStructure.Neutral;
+                        reason = "LL + LH formed, but price has broken above the LH " + Fmt(h0.Price) + ".";
+                    }
+                    else
+                    {
+                        state = MarketStructure.Bearish;
+                        reason = "LL + LH with meaningful expansion.";
+                    }
+                }
+                else
+                {
+                    state = MarketStructure.Neutral;
+                    reason = "Mixed structure - highs and lows are not moving in the same direction.";
+                }
+            }
+
+            var previous = CurrentStructure;
+            CurrentStructure = state;
+            _structureReason = reason;
+
+            if (swingsChanged || state != previous)
+                LogStructureUpdate(h0, h1, l0, l1, highDiff, lowDiff, atr, range);
+
+            if (state == previous) return false;
+
+            LogStructureChange(state, reason, h0, l0, i);
+
+            // Pending orders must never bypass the structure filter: remove the ones no longer allowed.
+            if (previous == MarketStructure.Bullish && CancelFibOrder(ActiveBullFib, "market structure is now " + Upper(state)))
+                ActiveBullFib.TradeAttempted = false;   // may be placed again if bullish structure returns
+            if (previous == MarketStructure.Bearish && CancelFibOrder(ActiveBearFib, "market structure is now " + Upper(state)))
+                ActiveBearFib.TradeAttempted = false;   // may be placed again if bearish structure returns
+
+            return state == MarketStructure.Bullish || state == MarketStructure.Bearish;
         }
 
-        private void ResolvePendingLL(int upTo, int currentIndex, bool createFib)
-        {
-            int idx = LowestIndex(_llSearchFrom, upTo);
-            var ll = new SwingPoint(idx, Bars.LowPrices[idx], Bars.OpenTimes[idx]);
-            Mark(ll, "LL", false);
-            LastLL = ll;
-            if (_swingLow == null || _swingLow.Broken || idx > _swingLow.Index)
-                _swingLow = ll;
-            _pendingLL = false;
+        private bool StructureAllowsTrading =>
+            CurrentStructure == MarketStructure.Bullish || CurrentStructure == MarketStructure.Bearish;
 
-            if (createFib) CreateFib(false, LastLH, ll, currentIndex);
+        private static string Upper(MarketStructure s) => s.ToString().ToUpperInvariant();
+
+        private string SwingText(SwingPoint sp) =>
+            sp == null ? "n/a" : Fmt(sp.Price) + (string.IsNullOrEmpty(sp.Label) ? "" : " (" + sp.Label + ")") +
+                                 string.Format("  {0:yyyy-MM-dd HH:mm}", sp.Time);
+
+        private string Num(double v) => double.IsNaN(v) ? "n/a" : Fmt(v);
+
+        private void LogStructureUpdate(SwingPoint h0, SwingPoint h1, SwingPoint l0, SwingPoint l1,
+            double highDiff, double lowDiff, double atr, double range)
+        {
+            if (!PrintToLog || _loadingHistory) return;
+
+            bool permission = StructureAllowsTrading && !MonthlyTargetReached;
+            Print("=========================================");
+            Print("MARKET STRUCTURE UPDATE");
+            Print("Latest Swing High: {0}", SwingText(h0));
+            Print("Previous Swing High: {0}", SwingText(h1));
+            Print("Latest Swing Low: {0}", SwingText(l0));
+            Print("Previous Swing Low: {0}", SwingText(l1));
+            Print("High Difference: {0}", Num(highDiff));
+            Print("Low Difference: {0}", Num(lowDiff));
+            Print("ATR: {0}", Num(atr));
+            Print("Minimum Swing Size: {0}", Num(atr * MinimumSwingSizeATR));
+            Print("Structure Range: {0}", Num(range));
+            Print("Minimum Trend Range: {0}", Num(atr * MinimumTrendRangeATR));
+            Print("Structure: {0}", Upper(CurrentStructure));
+            Print("Trade Permission: {0}", permission
+                ? (CurrentStructure == MarketStructure.Bullish ? "YES (BUY setups only)" : "YES (SELL setups only)")
+                : "NO");
+            Print("=========================================");
+        }
+
+        private void LogStructureChange(MarketStructure state, string reason, SwingPoint h0, SwingPoint l0, int i)
+        {
+            if (state == MarketStructure.Consolidating && CanDraw)
+            {
+                var t = Chart.DrawText("MS_CONS_" + i, "CONS", i, Bars.HighPrices[i], Color.Orange);
+                t.HorizontalAlignment = HorizontalAlignment.Center;
+                t.VerticalAlignment = VerticalAlignment.Top;
+                t.FontSize = 9;
+            }
+
+            if (!PrintToLog || _loadingHistory) return;
+
+            switch (state)
+            {
+                case MarketStructure.Bullish:
+                    Print("BULLISH STRUCTURE CONFIRMED");
+                    Print("HH: {0}", SwingText(h0));
+                    Print("HL: {0}", SwingText(l0));
+                    Print("Trend entries enabled for BUY setups.");
+                    break;
+                case MarketStructure.Bearish:
+                    Print("BEARISH STRUCTURE CONFIRMED");
+                    Print("LL: {0}", SwingText(l0));
+                    Print("LH: {0}", SwingText(h0));
+                    Print("Trend entries enabled for SELL setups.");
+                    break;
+                case MarketStructure.Consolidating:
+                    Print("CONSOLIDATION DETECTED");
+                    Print("No new trades allowed.");
+                    Print("Reason: {0}", reason);
+                    break;
+                default:
+                    Print("MARKET STRUCTURE {0}", Upper(state));
+                    Print("No new trades allowed.");
+                    Print("Reason: {0}", reason);
+                    break;
+            }
+        }
+
+        // Places the waiting setup in the direction of the current structure (if any).
+        private void PlaceOrderForStructure()
+        {
+            if (CurrentStructure == MarketStructure.Bullish) TryPlaceOrder(ActiveBullFib);
+            else if (CurrentStructure == MarketStructure.Bearish) TryPlaceOrder(ActiveBearFib);
         }
 
         // =====================================================================
@@ -536,8 +837,7 @@ namespace cAlgo.Robots
             for (int k = zero.Index + 1; k <= currentIndex; k++)
                 CheckFib(f, k);
 
-            // STEP 3: place the order at 0.62 (live only, not while rebuilding history)
-            if (!_loadingHistory) TryPlaceOrder(f);
+            // STEP 3 (the order at 0.62) is placed by ProcessBar once the structure state is known.
         }
 
         private void CheckFib(FibSetup f, int i)
@@ -594,12 +894,8 @@ namespace cAlgo.Robots
         {
             if (!EnableTrading || f == null || f.TradeAttempted || f.Touched || f.Invalidated) return;
 
-            // Only trade in the direction of the structure.
-            if (f.IsBullish && Trend != StructureTrend.Bullish) return;
-            if (!f.IsBullish && Trend != StructureTrend.Bearish) return;
-
-            // Monthly profit target: no new trades once this month's target is reached.
-            if (!CanOpenNewTrade()) return;
+            // Monthly profit target + market structure (direction, no consolidation / neutral).
+            if (!CanOpenNewTrade(f.IsBullish)) return;
             if (f.TradeAttempted) return;   // the monthly reset above may already have placed this setup
 
             // News filter: hold the setup; it is retried when the news window ends.
@@ -760,8 +1056,7 @@ namespace cAlgo.Robots
             _noStopSinceTick.Remove(args.Position.Id);
 
             // A trade slot is free: a setup that was waiting for it may now be placed.
-            if (Trend == StructureTrend.Bullish) TryPlaceOrder(ActiveBullFib);
-            if (Trend == StructureTrend.Bearish) TryPlaceOrder(ActiveBearFib);
+            PlaceOrderForStructure();
         }
 
         // =====================================================================
@@ -1236,8 +1531,7 @@ namespace cAlgo.Robots
                 Print("NEWS WINDOW END - trading resumed.");
 
                 // Re-place the order of a setup that is still valid (not touched, not invalidated).
-                if (Trend == StructureTrend.Bullish) TryPlaceOrder(ActiveBullFib);
-                if (Trend == StructureTrend.Bearish) TryPlaceOrder(ActiveBearFib);
+                PlaceOrderForStructure();
             }
         }
 
@@ -1260,8 +1554,12 @@ namespace cAlgo.Robots
 
         private bool UseMonthlyStorage => RunningMode == RunningMode.RealTime;
 
-        // Every new trade goes through TryPlaceOrder, which calls this first.
-        private bool CanOpenNewTrade()
+        // Every new trade (market or pending) goes through TryPlaceOrder, which calls this first:
+        //   1) monthly 10% target lock
+        //   2) valid market structure (not CONSOLIDATING / NEUTRAL / UNKNOWN)
+        //   3) setup direction = structure direction (BUY only BULLISH, SELL only BEARISH)
+        // The 1% risk volume check follows in TryPlaceOrder (no trade if the volume is invalid).
+        private bool CanOpenNewTrade(bool isBuy)
         {
             CheckMonthlyTarget();
 
@@ -1271,6 +1569,29 @@ namespace cAlgo.Robots
                 Print("Reason: Monthly {0}% profit target already reached ({1}).",
                     MonthlyProfitTargetPercent.ToString("0.##", CultureInfo.InvariantCulture), MonthKey);
                 Print("Next trading period: Next calendar month.");
+                return false;
+            }
+
+            if (CurrentStructure == MarketStructure.Consolidating
+                || CurrentStructure == MarketStructure.Neutral
+                || CurrentStructure == MarketStructure.Unknown)
+            {
+                Print("TRADE BLOCKED");
+                Print("Reason: market structure is {0} - no trend, no entry. {1}", Upper(CurrentStructure), _structureReason);
+                return false;
+            }
+
+            if (isBuy && CurrentStructure != MarketStructure.Bullish)
+            {
+                Print("TRADE BLOCKED");
+                Print("Reason: BUY setups need BULLISH structure (current: {0}).", Upper(CurrentStructure));
+                return false;
+            }
+
+            if (!isBuy && CurrentStructure != MarketStructure.Bearish)
+            {
+                Print("TRADE BLOCKED");
+                Print("Reason: SELL setups need BEARISH structure (current: {0}).", Upper(CurrentStructure));
                 return false;
             }
 
@@ -1382,8 +1703,7 @@ namespace cAlgo.Robots
             // A setup that is still valid (not touched / not invalidated) may be traded again.
             if (!_loadingHistory && !_inNewsBlackout)
             {
-                if (Trend == StructureTrend.Bullish) TryPlaceOrder(ActiveBullFib);
-                if (Trend == StructureTrend.Bearish) TryPlaceOrder(ActiveBearFib);
+                PlaceOrderForStructure();
             }
         }
 
@@ -1520,46 +1840,28 @@ namespace cAlgo.Robots
         // =====================================================================
         private string Fmt(double price) => price.ToString("N" + Symbol.Digits, CultureInfo.InvariantCulture);
 
-        private int HighestIndex(int from, int to)
-        {
-            from = Math.Max(0, from);
-            to = Math.Max(from, to);
-            int best = from;
-            for (int k = from + 1; k <= to; k++)
-                if (Bars.HighPrices[k] > Bars.HighPrices[best]) best = k;
-            return best;
-        }
+        // Labels only for SIGNIFICANT swings (HH / HL / LH / LL).
+        private string SwingLabelName(SwingPoint sp) => "MS_SW_" + (sp.IsHigh ? "H" : "L") + sp.Index;
 
-        private int LowestIndex(int from, int to)
+        private void DrawSwingLabel(SwingPoint sp)
         {
-            from = Math.Max(0, from);
-            to = Math.Max(from, to);
-            int best = from;
-            for (int k = from + 1; k <= to; k++)
-                if (Bars.LowPrices[k] < Bars.LowPrices[best]) best = k;
-            return best;
-        }
-
-        private void Mark(SwingPoint sp, string label, bool isHigh)
-        {
-            sp.Label = label;
-            string key = (isHigh ? "H" : "L") + sp.Index;
-
-            string text = label;
-            if (_labels.TryGetValue(key, out var existing) && !existing.EndsWith(label))
-                text = existing + "→" + label;
-            _labels[key] = text;
+            if (string.IsNullOrEmpty(sp.Label)) return;
 
             if (PrintToLog && !_loadingHistory)
-                Print("{0} at {1}  ({2:yyyy-MM-dd HH:mm})  Trend: {3}", text, Fmt(sp.Price), sp.Time, Trend);
+                Print("{0} at {1}  ({2:yyyy-MM-dd HH:mm})", sp.Label, Fmt(sp.Price), sp.Time);
 
             if (!CanDraw) return;
 
-            var color = label.StartsWith("H") ? Color.LimeGreen : Color.Red;
-            var t = Chart.DrawText("MS_" + key, text, sp.Index, sp.Price, color);
+            var color = sp.Label.StartsWith("H") ? Color.LimeGreen : Color.Red;
+            var t = Chart.DrawText(SwingLabelName(sp), sp.Label, sp.Index, sp.Price, color);
             t.HorizontalAlignment = HorizontalAlignment.Center;
-            t.VerticalAlignment = isHigh ? VerticalAlignment.Top : VerticalAlignment.Bottom;
+            t.VerticalAlignment = sp.IsHigh ? VerticalAlignment.Top : VerticalAlignment.Bottom;
             t.FontSize = 11;
+        }
+
+        private void RemoveSwingLabel(SwingPoint sp)
+        {
+            if (sp != null && CanDraw) Chart.RemoveObject(SwingLabelName(sp));
         }
 
         private void DrawBreak(SwingPoint broken, int breakIndex, string text, bool bullish)
